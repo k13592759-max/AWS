@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Production Builds
+dist/
+dist-ssr/
+build/
+.aws-sam/
+
+# Environment Variables & Local Data
+.env
+.env.local
+.env.*.local
+*.log
+local_tickets_db.json
+backend/uploads/
+
+# Generated Frontend Build
+frontend/dist/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

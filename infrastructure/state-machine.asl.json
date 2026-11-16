@@ -1,0 +1,67 @@
+{
+  "Comment": "CampusFix AI SLA Escalation Workflow - Tracks ticket resolution time and triggers automated escalation when SLA is breached.",
+  "StartAt": "WaitForSLA",
+  "States": {
+    "WaitForSLA": {
+      "Type": "Wait",
+      "SecondsPath": "$.slaSeconds",
+      "Next": "CheckTicketStatus"
+    },
+    "CheckTicketStatus": {
+      "Type": "Task",
+      "Resource": "${CheckStatusFunctionArn}",
+      "ResultPath": "$.checkResult",
+      "Next": "EvaluateTicketStatus",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.AWSLambdaException"],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ]
+    },
+    "EvaluateTicketStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.checkResult.status",
+          "StringEquals": "RESOLVED",
+          "Next": "TicketAlreadyResolved"
+        },
+        {
+          "Variable": "$.checkResult.status",
+          "StringEquals": "ESCALATED",
+          "Next": "TicketAlreadyEscalated"
+        }
+      ],
+      "Default": "TriggerEscalation"
+    },
+    "TriggerEscalation": {
+      "Type": "Task",
+      "Resource": "${EscalateFunctionArn}",
+      "ResultPath": "$.escalationResult",
+      "Next": "EscalationCompleted",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ]
+    },
+    "TicketAlreadyResolved": {
+      "Type": "Succeed",
+      "Comment": "Issue was successfully resolved by campus facilities team prior to SLA breach."
+    },
+    "TicketAlreadyEscalated": {
+      "Type": "Succeed",
+      "Comment": "Ticket has already undergone escalation."
+    },
+    "EscalationCompleted": {
+      "Type": "Succeed",
+      "Comment": "Ticket SLA was breached. Status escalated to ESCALATED and notification dispatched."
+    }
+  }
+}

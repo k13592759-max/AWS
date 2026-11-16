@@ -1,0 +1,234 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  CampusFix AI - Smart Campus Infrastructure Issue Reporting & Automatic Escalation Platform.
+  Region: ap-south-1 (Mumbai).
+
+Parameters:
+  DefaultSlaSeconds:
+    Type: Number
+    Default: 60
+    Description: SLA duration in seconds before automatic escalation is triggered (default 60s for live demonstration).
+
+Globals:
+  Function:
+    Timeout: 20
+    MemorySize: 256
+    Runtime: python3.12
+    Environment:
+      Variables:
+        TICKETS_TABLE: !Ref TicketsTable
+        UPLOADS_BUCKET: !Ref UploadsBucket
+        STATE_MACHINE_ARN: !Ref EscalationStateMachine
+        DEFAULT_SLA_SECONDS: !Ref DefaultSlaSeconds
+        AWS_REGION_NAME: !Ref "AWS::Region"
+
+Resources:
+  # =========================================================================
+  # HTTP API Gateway (v2) with Full CORS Support
+  # =========================================================================
+  CampusFixHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Name: CampusFixApi
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - GET
+          - POST
+          - PATCH
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+          - X-Amz-Date
+          - X-Api-Key
+          - X-Amz-Security-Token
+        MaxAge: 600
+
+  # =========================================================================
+  # DynamoDB Table - CampusFixTickets
+  # =========================================================================
+  TicketsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: CampusFixTickets
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ticketId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: building
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ticketId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: BuildingIndex
+          KeySchema:
+            - AttributeName: building
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # =========================================================================
+  # S3 Bucket for Photographic Evidence
+  # =========================================================================
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "campusfix-evidence-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+              - HEAD
+            AllowedOrigins:
+              - "*"
+            MaxAge: 3600
+
+  # =========================================================================
+  # Lambda Function: Tickets API (CRUD + Triggers Step Functions)
+  # =========================================================================
+  TicketsApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/api/
+      Handler: tickets_handler.lambda_handler
+      Description: Handles ticket creation, retrieval, updates, and SLA escalation initiation
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TicketsTable
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt EscalationStateMachine.Name
+      Events:
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CampusFixHttpApi
+            Path: /health
+            Method: GET
+        ListTickets:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CampusFixHttpApi
+            Path: /tickets
+            Method: GET
+        CreateTicket:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CampusFixHttpApi
+            Path: /tickets
+            Method: POST
+        GetTicket:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CampusFixHttpApi
+            Path: /tickets/{ticketId}
+            Method: GET
+        UpdateTicket:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CampusFixHttpApi
+            Path: /tickets/{ticketId}
+            Method: PATCH
+
+  # =========================================================================
+  # Lambda Function: S3 Presigned Upload URL Generator
+  # =========================================================================
+  PresignUploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/api/
+      Handler: uploads_handler.lambda_handler
+      Description: Generates secure S3 presigned PUT URLs for evidence image uploads
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Sub "campusfix-evidence-${AWS::AccountId}-${AWS::Region}"
+      Events:
+        Presign:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CampusFixHttpApi
+            Path: /uploads/presign
+            Method: POST
+
+  # =========================================================================
+  # Lambda Function: Check Status (Invoked by Step Functions)
+  # =========================================================================
+  CheckStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/escalation/
+      Handler: check_status_handler.lambda_handler
+      Description: Evaluates whether a ticket is still pending or has been resolved
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref TicketsTable
+
+  # =========================================================================
+  # Lambda Function: Escalate Ticket (Invoked by Step Functions)
+  # =========================================================================
+  EscalateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/escalation/
+      Handler: escalate_handler.lambda_handler
+      Description: Escalates unresolved ticket, records timestamp, reason, and updates timeline
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TicketsTable
+
+  # =========================================================================
+  # Step Functions State Machine - Automated Escalation Workflow
+  # =========================================================================
+  EscalationStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: CampusFix-EscalationWorkflow
+      DefinitionUri: state-machine.asl.json
+      DefinitionSubstitutions:
+        CheckStatusFunctionArn: !GetAtt CheckStatusFunction.Arn
+        EscalateFunctionArn: !GetAtt EscalateFunction.Arn
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CheckStatusFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref EscalateFunction
+
+Outputs:
+  ApiEndpoint:
+    Description: HTTP API Gateway endpoint base URL
+    Value: !Sub "https://${CampusFixHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  TicketsTableName:
+    Description: DynamoDB Table Name for Campus Tickets
+    Value: !Ref TicketsTable
+  UploadsBucketName:
+    Description: S3 Bucket Name for Photographic Evidence
+    Value: !Ref UploadsBucket
+  EscalationStateMachineArn:
+    Description: Step Functions State Machine ARN for Automatic Escalation
+    Value: !Ref EscalationStateMachine
